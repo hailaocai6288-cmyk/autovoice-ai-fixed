@@ -246,6 +246,38 @@ Hãy trả về toàn bộ kết quả theo đúng cấu trúc JSON đã yêu c�
 // ---------------------------------------------------------------------------
 const TTS_MODELS = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts', 'gemini-3.1-flash-tts-preview'];
 
+// [SỬA LỖI ĐỔI GIỌNG] Mỗi model TTS có âm sắc khác nhau. Trước đây khi model đầu bị 429/503
+// thì tự nhảy sang model khác giữa chừng -> giọng đổi giữa các đoạn. Giờ "khóa" model đã chạy
+// thành công và dùng lại cho mọi đoạn sau; chỉ chuyển model khi model đó thật sự hỏng (404/400).
+let stickyModel: string | null = null;
+function orderedModels(): string[] {
+  return stickyModel ? [stickyModel, ...TTS_MODELS.filter((m) => m !== stickyModel)] : TTS_MODELS;
+}
+
+// [SỬA LỖI ĐỔI GIỌNG] Gemini TTS không có giọng Bắc/Nam cố định -> nếu không chỉ định vùng miền,
+// mỗi lần gọi nó tự đoán và giọng bị lúc Bắc lúc Nam. Luôn gắn 1 vùng miền cố định cho mọi đoạn.
+// Đổi mặc định sang giọng Nam: thay 'bac' thành 'nam' ở dòng dưới.
+const DEFAULT_VI_ACCENT = 'bac';
+const ACCENT_STYLE: Record<string, string> = {
+  bac: 'Giọng miền Bắc chuẩn Hà Nội',
+  nam: 'Giọng miền Nam chuẩn Sài Gòn',
+  trung: 'Giọng miền Trung chuẩn Huế',
+};
+
+function buildStyle(style: string, language: string, accent?: string): string {
+  let s = String(style || '').replace(/[:：]\s*$/, '').trim();
+  if (language !== 'vi') return s.slice(0, 120);
+
+  // Nếu style từ giao diện đã nêu rõ vùng miền thì giữ nguyên, không ghi đè.
+  if (/miền\s*(bắc|nam|trung)|hà nội|sài gòn|huế/i.test(s)) return s.slice(0, 120);
+
+  const key = accent && ACCENT_STYLE[accent] ? accent : DEFAULT_VI_ACCENT;
+  const accentText = ACCENT_STYLE[key];
+  // Đặt vùng miền lên đầu rồi mới cắt, để không bao giờ bị cắt mất.
+  const rest = s.slice(0, Math.max(0, 120 - accentText.length - 2));
+  return rest ? `${accentText}, ${rest}` : accentText;
+}
+
 function parseWav(buf: Buffer): { pcm: Buffer; sampleRate: number } {
   if (buf.length > 44 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WAVE') {
     let off = 12;
@@ -359,8 +391,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 app.post('/api/tts', async (req, res) => {
   try {
-    const { text, voiceName = 'Kore', language = 'vi' } = req.body;
-    let { style = '' } = req.body;
+    const { text, voiceName = 'Kore', language = 'vi', accent } = req.body;
+    const { style: rawStyle = '' } = req.body;
 
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'Nội dung text không hợp lệ' });
@@ -369,25 +401,28 @@ app.post('/api/tts', async (req, res) => {
       return res.status(500).json({ error: 'Chưa cấu hình GEMINI_API_KEY' });
     }
 
-    // style phải NGẮN: chỉ mô tả cách đọc, không phải đoạn văn
-    style = String(style || '').replace(/[:：]\s*$/, '').trim().slice(0, 120);
+    // style phải NGẮN, luôn kèm vùng miền cố định để các đoạn không đổi giọng
+    const style = buildStyle(rawStyle, language, accent);
 
     let lastErr: any = null;
-    for (const model of TTS_MODELS) {
-      for (let attempt = 0; attempt < 4; attempt++) {
+    for (const model of orderedModels()) {
+      // Thử lại NHIỀU lần trên cùng 1 model khi bị giới hạn tốc độ, thay vì nhảy sang model khác.
+      for (let attempt = 0; attempt < 6; attempt++) {
         try {
           const raw = await synthWithModel(model, text.trim(), voiceName, style);
           const { pcm, sampleRate } = parseWav(raw);
           const cleaned = cleanTail(pcm, sampleRate);
           const wav = wrapWav(cleaned, sampleRate);
+          stickyModel = model; // khóa model này cho các đoạn sau
           return res.json({ audioData: wav.toString('base64'), mimeType: 'audio/wav', model });
         } catch (e: any) {
           lastErr = e;
           if (e.status === 429 || e.status === 503 || e.status === 500) {
-            await sleep(2500 * (attempt + 1)); // chạm giới hạn tốc độ -> chờ rồi thử lại
+            await sleep(Math.min(2500 * (attempt + 1), 8000)); // chạm giới hạn tốc độ -> chờ rồi thử lại
             continue;
           }
-          break; // 404 (model bị gỡ), 400... -> sang model kế
+          if (stickyModel === model) stickyModel = null; // model hỏng thật (404/400...) -> bỏ khóa
+          break; // sang model kế
         }
       }
     }
