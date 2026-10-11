@@ -1,0 +1,6 @@
+{
+  "name": "AutoVoice AI - Lồng Tiếng Video Màn Hình Tự Động",
+  "description": "Tự động phân tích thao tác chuột trên video quay màn hình Camtasia, sáng tác kịch bản lồng tiếng khớp từng giây với Gemini AI và xuất bản video kèm thuyết minh giọng đọc tự nhiên.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
